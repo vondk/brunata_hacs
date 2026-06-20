@@ -1,20 +1,44 @@
 """The Brunata integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import socket
 from datetime import datetime, timedelta
+
+try:
+    # httpx is a dependency of brunata_api and always available at runtime.
+    # The IDE may not resolve it if httpx is not installed in the dev environment.
+    import httpx as _httpx
+    _CONNECT_ERRORS = (ConnectionError, UnboundLocalError, _httpx.ConnectError, _httpx.ConnectTimeout, _httpx.ReadTimeout)
+except ImportError:
+    _CONNECT_ERRORS = (ConnectionError, UnboundLocalError)
 
 from brunata_api import Client
 from brunata_api.const import OAUTH2_URL, CLIENT_ID
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_DEBUG_LOGGING
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def _check_connectivity(host: str, port: int = 443, timeout: float = 5.0) -> bool:
+    """Quick TCP check to verify network reachability before invoking the library."""
+    try:
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(None, socket.create_connection, (host, port)),
+            timeout=timeout,
+        )
+        return True
+    except Exception:
+        return False
+
 
 # Monkeypatch to fix bug in brunata_api library where it awaits a dict in _renew_tokens
 async def _renew_tokens_fixed(self) -> dict:
@@ -36,9 +60,13 @@ async def _renew_tokens_fixed(self) -> dict:
                 "CLIENT_ID": CLIENT_ID,
             },
         )
+    except UnboundLocalError:
+        # Library bug: api_wrapper catches ConnectError but then tries to return an
+        # unassigned 'response' variable — treat this as a network connectivity error.
+        raise ConnectionError("Brunata token server unreachable") from None
     except Exception:
         _LOGGER.exception("An error occurred while trying to renew tokens")
-        return {}
+        raise
     return tokens.json()
 
 Client._renew_tokens = _renew_tokens_fixed
@@ -54,6 +82,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     email = entry.data[CONF_EMAIL]
     password = entry.data[CONF_PASSWORD]
+
+    if not await _check_connectivity("online.brunata.com"):
+        raise ConfigEntryNotReady("Cannot reach Brunata servers — network not ready, will retry")
 
     _LOGGER.debug("Setting up Brunata integration for %s", email)
     client = await hass.async_add_executor_job(Client, email, password)
@@ -226,5 +257,14 @@ class BrunataDataUpdateCoordinator(DataUpdateCoordinator):
             return dict(self.client._meters)
         except UpdateFailed:
             raise
+        except _CONNECT_ERRORS as err:
+            # Covers httpx.ConnectError/ConnectTimeout/ReadTimeout (network unavailable),
+            # ConnectionError (raised by _renew_tokens_fixed), and UnboundLocalError
+            # (library bug in api_wrapper when a ConnectError occurs mid-call).
+            if self.data is not None:
+                # Keep sensors available with their last known values instead of going unavailable.
+                _LOGGER.info("Cannot connect to Brunata — keeping last known values")
+                return self.data
+            raise UpdateFailed("Cannot connect to Brunata — will retry next interval") from err
         except Exception as err:
             raise UpdateFailed(f"Unexpected error fetching data: {err}") from err

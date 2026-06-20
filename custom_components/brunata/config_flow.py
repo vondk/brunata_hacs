@@ -25,7 +25,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, str]) -> dict[str,
     """
     _LOGGER.debug("Validating input for %s", data[CONF_EMAIL])
     client = await hass.async_add_executor_job(Client, data[CONF_EMAIL], data[CONF_PASSWORD])
-    
+
     try:
         # Attempt to fetch meters to validate login
         _LOGGER.debug("Attempting to validate login by fetching meters for %s", data[CONF_EMAIL])
@@ -34,7 +34,16 @@ async def validate_input(hass: HomeAssistant, data: dict[str, str]) -> dict[str,
             meters = await client.get_meters()
         except TypeError as err:
             if "await" in str(err) and "dict" in str(err):
-                 _LOGGER.error("Error in brunata-api library: 'object dict can't be used in await expression'")
+                _LOGGER.error("Error in brunata-api library: 'object dict can't be used in await expression'")
+            raise InvalidAuth from err
+        except UnboundLocalError as err:
+            # brunata_api bug: when the network is unavailable, api_wrapper raises
+            # ConnectError which the library catches internally, but then continues
+            # and tries to use the 'response' variable that was never assigned.
+            # This surfaces as an UnboundLocalError instead of a connection error.
+            if "'response'" in str(err):
+                _LOGGER.error("Cannot connect to Brunata API (network error): %s", err)
+                raise CannotConnect from err
             raise InvalidAuth from err
 
         if isinstance(meters, dict) and (
@@ -48,8 +57,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, str]) -> dict[str,
             _LOGGER.debug("Login validated, found %s meters", len(meters))
         else:
             _LOGGER.warning("Login validated, but no meters found")
-    except InvalidAuth:
-        _LOGGER.warning("Authentication failed for %s", data[CONF_EMAIL])
+    except (InvalidAuth, CannotConnect):
         raise
     except Exception as err:
         _LOGGER.error("Could not validate Brunata login: %s", err)
@@ -73,6 +81,8 @@ class BrunataConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 info = await validate_input(self.hass, user_input)
                 _LOGGER.debug("Config entry created for %s", user_input[CONF_EMAIL])
                 return self.async_create_entry(title=info["title"], data=user_input)
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
             except Exception:  # pylint: disable=broad-except
@@ -148,6 +158,9 @@ class BrunataOptionsFlowHandler(config_entries.OptionsFlow):
                 }
             ),
         )
+
+class CannotConnect(HomeAssistantError):
+    """Error to indicate we cannot connect to the Brunata API."""
 
 class InvalidAuth(HomeAssistantError):
     """Error to indicate there is invalid auth."""

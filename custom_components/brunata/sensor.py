@@ -81,7 +81,10 @@ class BrunataSensor(CoordinatorEntity, SensorEntity):
         else:
             self._attr_icon = "mdi:gauge"
 
-        self._attr_state_class = SensorStateClass.TOTAL_INCREASING
+        # TOTAL (not TOTAL_INCREASING) prevents HA from treating a temporarily
+        # lower API value as a meter reset, which would produce a large false spike
+        # in statistics on the first update after setup.
+        self._attr_state_class = SensorStateClass.TOTAL
         self._attr_suggested_display_precision = 2
 
         # Group under a device per meter

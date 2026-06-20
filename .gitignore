@@ -13,3 +13,4 @@
 
 # Hemmelige filer
 .env
+.claude/

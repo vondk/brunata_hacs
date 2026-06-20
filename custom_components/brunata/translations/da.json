@@ -10,6 +10,7 @@
       }
     },
     "error": {
+      "cannot_connect": "Kan ikke oprette forbindelse til Brunata API. Tjek din netværksforbindelse.",
       "invalid_auth": "Ugyldigt login",
       "unknown": "Uventet fejl"
     },
