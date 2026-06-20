@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import html
 import logging
+import os
+import re
 import socket
 from datetime import datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 
 try:
     # httpx is a dependency of brunata_api and always available at runtime.
@@ -70,6 +76,133 @@ async def _renew_tokens_fixed(self) -> dict:
     return tokens.json()
 
 Client._renew_tokens = _renew_tokens_fixed
+
+
+# --- Keycloak login override -------------------------------------------------
+# In mid-2026 Brunata migrated authentication from Azure AD B2C
+# (brunatab2cprod.b2clogin.com) to Keycloak (realm "online-prod"). The
+# brunata_api library still requests the old Azure OAuth client, so Keycloak
+# rejects login with HTTP 400 "clientNotFoundMessage", which then cascades to a
+# 401 on every data call. The values below are taken from Brunata's current web
+# app and verified against the live Keycloak server.
+KC_REALM_BASE = "https://online.brunata.com/iam/realms/online-prod/protocol/openid-connect"
+KC_AUTHORIZE_URL = f"{KC_REALM_BASE}/auth"
+KC_TOKEN_URL = f"{KC_REALM_BASE}/token"
+KC_CLIENT_ID = "82770188-c92e-4d16-927d-a15c472eda55"
+KC_REDIRECT_URI = "https://online.brunata.com/auth-redirect"
+KC_SCOPE = "openid offline_access"
+# Keycloak login form is served as <form id="kc-form-login" ... action="...">
+_KC_FORM_ACTION_RE = re.compile(r'id="kc-form-login"[^>]*action="([^"]+)"', re.IGNORECASE)
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+async def _keycloak_get_tokens(self) -> bool:
+    """Authenticate against Brunata's Keycloak realm using the OAuth 2.0
+    Authorization Code + PKCE flow, and store the access token on the session.
+
+    This fully replaces the library's stale Azure-B2C login. It only relies on
+    the client's ``_session`` (an ``httpx.AsyncClient``), ``_username`` and
+    ``_password`` attributes, so it is independent of the library's internals.
+    Raises ``ConfigEntryAuthFailed`` on bad credentials so HA can prompt for
+    re-authentication.
+    """
+    session = self._session
+
+    # Drop any stale Authorization header before logging in again.
+    session.headers.pop("Authorization", None)
+
+    # PKCE challenge
+    code_verifier = re.sub(
+        "[^a-zA-Z0-9]+", "", base64.urlsafe_b64encode(os.urandom(40)).decode("utf-8")
+    )
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("utf-8")).digest())
+        .decode("utf-8")
+        .rstrip("=")
+    )
+
+    # 1) Fetch the login page (sets AUTH_SESSION_ID / KC_RESTART cookies).
+    page = await session.get(
+        KC_AUTHORIZE_URL,
+        params={
+            "client_id": KC_CLIENT_ID,
+            "redirect_uri": KC_REDIRECT_URI,
+            "scope": KC_SCOPE,
+            "response_type": "code",
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=True,
+    )
+    page.raise_for_status()
+
+    match = _KC_FORM_ACTION_RE.search(page.text)
+    if not match:
+        _LOGGER.error("Brunata Keycloak login form not found — auth flow may have changed")
+        raise ConfigEntryAuthFailed("Brunata login form not found (Keycloak flow changed)")
+    form_action = html.unescape(match.group(1))
+
+    # 2) Submit credentials. On success Keycloak issues a 302 to the redirect
+    #    URI carrying the authorization code; on failure it re-renders the form.
+    auth = await session.post(
+        form_action,
+        data={
+            "username": self._username,
+            "password": self._password,
+            "credentialId": "",
+        },
+        follow_redirects=False,
+    )
+    if auth.status_code not in _REDIRECT_STATUSES:
+        _LOGGER.error("Brunata authentication failed (status %s) — check credentials", auth.status_code)
+        raise ConfigEntryAuthFailed("Brunata authentication failed — check email and password")
+
+    location = auth.headers.get("Location", "")
+    if not location.startswith(KC_REDIRECT_URI):
+        _LOGGER.error("Unexpected redirect after Brunata login: %s", location)
+        raise ConfigEntryAuthFailed("Unexpected redirect after Brunata login")
+
+    auth_code = parse_qs(urlparse(location).query).get("code", [None])[0]
+    if not auth_code:
+        _LOGGER.error("No authorization code returned by Brunata login")
+        raise ConfigEntryAuthFailed("No authorization code returned by Brunata")
+
+    # 3) Exchange the code for tokens (public client + PKCE, no secret needed).
+    token_resp = await session.post(
+        KC_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": KC_CLIENT_ID,
+            "redirect_uri": KC_REDIRECT_URI,
+            "code": auth_code,
+            "code_verifier": code_verifier,
+        },
+        follow_redirects=False,
+    )
+    token_resp.raise_for_status()
+    tokens = token_resp.json()
+
+    if not tokens.get("access_token"):
+        self._tokens = {}
+        _LOGGER.error("Brunata token endpoint returned no access_token")
+        raise ConfigEntryAuthFailed("Brunata did not return an access token")
+
+    # Normalise expiry fields to what the library's helpers expect, then store.
+    now = int(datetime.now().timestamp())
+    if tokens.get("expires_in") is not None:
+        tokens["expires_on"] = now + int(tokens["expires_in"])
+    if tokens.get("refresh_expires_in") is not None:
+        tokens["refresh_token_expires_on"] = now + int(tokens["refresh_expires_in"])
+
+    session.headers.update(
+        {"Authorization": f"{tokens.get('token_type', 'Bearer')} {tokens['access_token']}"}
+    )
+    self._tokens.update(tokens)
+    return True
+
+
+Client._get_tokens = _keycloak_get_tokens
+# -----------------------------------------------------------------------------
 
 PLATFORMS: list[str] = ["sensor"]
 
@@ -255,7 +388,9 @@ class BrunataDataUpdateCoordinator(DataUpdateCoordinator):
             # Return a copy of the dictionary to ensure the coordinator detects changes
             _LOGGER.debug("Data update complete. Total meters: %s", len(self.client._meters))
             return dict(self.client._meters)
-        except UpdateFailed:
+        except (UpdateFailed, ConfigEntryAuthFailed):
+            # ConfigEntryAuthFailed (e.g. bad credentials during Keycloak login)
+            # must propagate so HA starts the re-authentication flow.
             raise
         except _CONNECT_ERRORS as err:
             # Covers httpx.ConnectError/ConnectTimeout/ReadTimeout (network unavailable),
